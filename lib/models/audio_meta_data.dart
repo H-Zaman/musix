@@ -1,4 +1,4 @@
-import 'package:just_audio_background/just_audio_background.dart';
+import 'package:audio_service/audio_service.dart';
 
 class AudioMetadata {
   final String title;
@@ -31,12 +31,13 @@ class AudioMetadata {
     artworkUri: json['artworkUri'],
   );
 
-  MediaItem toMediaItem() {
+  MediaItem toMediaItem({Duration? duration}) {
     return MediaItem(
       id: filePath,
       album: album,
       title: title,
       artist: artist,
+      duration: duration,
       artUri: artworkUri != null ? Uri.parse(artworkUri!) : null,
       extras: {'url': filePath},
     );

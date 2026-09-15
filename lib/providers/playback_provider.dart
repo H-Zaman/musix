@@ -1,97 +1,113 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:audio_session/audio_session.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:just_audio/just_audio.dart';
+import 'package:flutter_soloud/flutter_soloud.dart' hide AudioMetadata;
 import 'package:musix/models/audio_meta_data.dart';
-import 'package:musix/models/playlist.dart';
 import 'package:musix/models/position.dart';
 import 'package:path/path.dart' as p;
-import 'package:rxdart/rxdart.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart' as pp;
 
-class PlaybackProvider extends ChangeNotifier with WidgetsBindingObserver {
-  late AudioPlayer _player;
-  final ConcatenatingAudioSource _playlistSource = ConcatenatingAudioSource(children: []);
-  
+enum RepeatMode { off, all, one }
+
+class PlaybackProvider extends ChangeNotifier {
+  final SoLoud _soloud = SoLoud.instance;
+
   final List<AudioMetadata> _allSongs = [];
   List<AudioMetadata> _playableSongs = [];
-  final List<Playlist> _customPlaylists = [];
-  
+  List<AudioMetadata> _filteredSongs = [];
+  List<int> _playOrder = [];
+  int _orderPos = -1;
+
+  AudioSource? _currentSource;
+  SoundHandle? _currentHandle;
+  AudioMetadata? _currentSong;
+  Duration _currentDuration = Duration.zero;
+  Duration _currentPosition = Duration.zero;
+  bool _isPlaying = false;
+  bool _shuffleEnabled = false;
+  RepeatMode _repeatMode = RepeatMode.off;
+  Timer? _positionTimer;
+  final StreamController<PositionData> _positionController = StreamController.broadcast();
+
   bool _isScanning = false;
   final SharedPreferences _prefs;
+  String _searchQuery = '';
 
   static const String _prefSongsKey = 'musix_all_songs';
-  static const String _prefCustomPlaylistsKey = 'musix_custom_playlists';
   static const String _prefIndexKey = 'musix_current_index';
   static const String _prefPositionKey = 'musix_position';
 
-  AudioPlayer get player => _player;
-  List<AudioMetadata> get allSongs => _allSongs;
-  List<Playlist> get customPlaylists => _customPlaylists;
+  List<AudioMetadata> get filteredSongs => _filteredSongs;
   bool get isScanning => _isScanning;
+  String get searchQuery => _searchQuery;
+  AudioMetadata? get currentSong => _currentSong;
+  bool get isPlaying => _isPlaying;
+  bool get shuffleEnabled => _shuffleEnabled;
+  RepeatMode get repeatMode => _repeatMode;
+  Duration get currentDuration => _currentDuration;
+  Duration get currentPosition => _currentPosition;
+  bool get hasPrevious => _orderPos > 0 || _repeatMode == RepeatMode.all;
+  bool get hasNext => _orderPos + 1 < _playOrder.length || _repeatMode == RepeatMode.all;
+  int? get currentDisplayIndex => _currentSong == null ? null : _playableSongs.indexOf(_currentSong!) + 1;
 
-  Stream<PositionData> get positionDataStream => Rx.combineLatest3<Duration, Duration, Duration?, PositionData>(
-        _player.positionStream,
-        _player.bufferedPositionStream,
-        _player.durationStream,
-        (position, bufferedPosition, duration) => PositionData(position, bufferedPosition, duration ?? Duration.zero),
-      );
+  Stream<PositionData> get positionDataStream => _positionController.stream;
+  Stream<Float32List> get fftStream =>
+      _soloud.audioVisualizationEvents.map((d) => d.fftData ?? Float32List(0));
 
   PlaybackProvider(this._prefs) {
-    WidgetsBinding.instance.addObserver(this);
-    _player = AudioPlayer();
-    _initAudioSession();
-    _listenToPlayerChanges();
+    _initEngine();
     _loadInitialState();
   }
 
-  Future<void> _initAudioSession() async {
-    final session = await AudioSession.instance;
-    await session.configure(const AudioSessionConfiguration.music());
-  }
-
-  void _listenToPlayerChanges() {
-    _player.positionStream.listen((position) => _prefs.setInt(_prefPositionKey, position.inMilliseconds));
-    _player.currentIndexStream.listen((index) {
-      if (index != null) {
-        _prefs.setInt(_prefIndexKey, index);
-        notifyListeners();
+  Future<void> _initEngine() async {
+    try {
+      final session = await AudioSession.instance;
+      await session.configure(const AudioSessionConfiguration.music());
+    } catch (e) {
+      debugPrint('Audio session config error: $e');
+    }
+    try {
+      if (!_soloud.isInitialized) {
+        await _soloud.init();
       }
-    });
+      _soloud.setVisualizationEnabled(true);
+    } catch (e) {
+      debugPrint('SoLoud init error: $e');
+    }
   }
 
   Future<void> _loadInitialState() async {
-    // 1. Load cached songs for instant UI
     final songsJson = _prefs.getString(_prefSongsKey);
     if (songsJson != null) {
       final List<dynamic> decoded = jsonDecode(songsJson);
+      _allSongs.clear();
       _allSongs.addAll(decoded.map((e) => AudioMetadata.fromJson(e)));
-      await _updatePlayerSource(_allSongs);
-      
-      final savedIndex = _prefs.getInt(_prefIndexKey) ?? 0;
-      final savedPos = _prefs.getInt(_prefPositionKey) ?? 0;
-      final playlistLength = _playlistSource.length;
-      if (playlistLength > 0) {
-        await _player.seek(Duration(milliseconds: savedPos), index: savedIndex < playlistLength ? savedIndex : 0);
-      }
+      _applyFilter();
+      _updatePlayableSongs(_allSongs);
     }
-
-    // 2. Load custom playlists
-    final playlistJson = _prefs.getString(_prefCustomPlaylistsKey);
-    if (playlistJson != null) {
-      final List<dynamic> decoded = jsonDecode(playlistJson);
-      _customPlaylists.addAll(decoded.map((e) => Playlist.fromJson(e)));
-    }
-
     notifyListeners();
-
-    // 3. Automatic background scan of the App's Documents folder
     _autoScanLibrary();
+  }
+
+  void setSearchQuery(String query) {
+    _searchQuery = query;
+    _applyFilter();
+    notifyListeners();
+  }
+
+  void _applyFilter() {
+    if (_searchQuery.isEmpty) {
+      _filteredSongs = List.from(_allSongs);
+    } else {
+      _filteredSongs = _allSongs
+          .where((song) => song.title.toLowerCase().contains(_searchQuery.toLowerCase()))
+          .toList();
+    }
   }
 
   Future<void> _autoScanLibrary() async {
@@ -102,31 +118,35 @@ class PlaybackProvider extends ChangeNotifier with WidgetsBindingObserver {
     try {
       final docsDir = await pp.getApplicationDocumentsDirectory();
       final List<AudioMetadata> foundSongs = [];
-      
-      // Recursive scan of the app's own directory (full permission granted by iOS)
-      final entities = docsDir.listSync(recursive: true, followLinks: false);
-      
-      for (var entity in entities) {
-        if (entity is File) {
-          final ext = p.extension(entity.path).toLowerCase();
-          if (['.mp3', '.m4a', '.wav', '.aac', '.flac'].contains(ext)) {
-            foundSongs.add(AudioMetadata(
-              title: p.basenameWithoutExtension(entity.path),
-              artist: 'Local Artist',
-              album: p.basename(p.dirname(entity.path)),
-              filePath: entity.path,
-            ));
+
+      if (await docsDir.exists()) {
+        final entities = docsDir.listSync(recursive: true, followLinks: false);
+        for (var entity in entities) {
+          if (entity is File) {
+            final ext = p.extension(entity.path).toLowerCase();
+            if (['.mp3', '.m4a', '.wav', '.aac', '.flac'].contains(ext)) {
+              foundSongs.add(AudioMetadata(
+                title: p.basenameWithoutExtension(entity.path),
+                artist: 'Local Artist',
+                album: p.basename(p.dirname(entity.path)),
+                filePath: entity.path,
+              ));
+            }
           }
         }
       }
 
-      if (foundSongs.length != _allSongs.length || foundSongs.length != _playableSongs.length) {
+      // Always trust the fresh scan: cached paths reference the app's sandbox
+      // container UUID, which changes across rebuilds/reinstalls on iOS, so a
+      // matching count doesn't mean the cached paths are still valid.
+      final samePaths = foundSongs.length == _allSongs.length &&
+          foundSongs.every((s) => _allSongs.any((a) => a.filePath == s.filePath));
+      if (!samePaths) {
         _allSongs.clear();
         _allSongs.addAll(foundSongs);
+        _applyFilter();
         await _prefs.setString(_prefSongsKey, jsonEncode(_allSongs.map((e) => e.toJson()).toList()));
-        if (!_player.playing || _playlistSource.length == 0) {
-          await _updatePlayerSource(_allSongs);
-        }
+        _updatePlayableSongs(_allSongs);
       }
     } catch (e) {
       debugPrint('Library scan error: $e');
@@ -136,10 +156,9 @@ class PlaybackProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  // Allow manual import from other locations via picker and cleanly handle duplicates
   Future<void> importSongs() async {
     final result = await FilePicker.platform.pickFiles(
-      type: FileType.any, 
+      type: FileType.any,
       allowMultiple: true,
     );
     if (result != null) {
@@ -147,82 +166,204 @@ class PlaybackProvider extends ChangeNotifier with WidgetsBindingObserver {
       for (var file in result.files) {
         if (file.path != null) {
           final newPath = p.join(docsDir.path, file.name);
-          // If the file is not already in our internal app container directory, duplicate it inside safely
           if (!file.path!.startsWith(docsDir.path)) {
             final sourceFile = File(file.path!);
             await sourceFile.copy(newPath);
-            
-            // Clean up original file right after a successful verification copy to prevent system duplicates
             try {
               if (await sourceFile.exists()) {
                 await sourceFile.delete();
-                debugPrint('Successfully deleted original temporary source file: ${file.path}');
               }
             } catch (e) {
-              // On iOS real devices, if the file was selected from a external iCloud container, 
-              // the system treats it as read-only temporary context stream, so direct delete is restricted.
               debugPrint('Note: System handled or cloud-synced files do not allow direct app deletion: $e');
             }
           }
         }
       }
-      _autoScanLibrary();
+      await _autoScanLibrary();
     }
   }
 
-  Future<void> _updatePlayerSource(List<AudioMetadata> songs) async {
-    await _playlistSource.clear();
+  void _updatePlayableSongs(List<AudioMetadata> songs) {
     _playableSongs = songs.where((s) => File(s.filePath).existsSync()).toList();
-    await _playlistSource.addAll(
-      _playableSongs.map((s) => AudioSource.file(s.filePath, tag: s.toMediaItem())).toList(),
-    );
-    if (_player.audioSource == null) {
-      await _player.setAudioSource(_playlistSource);
-    }
-  }
-
-  Future<void> playTrack(AudioMetadata track) async {
-    final index = _playableSongs.indexWhere((s) => s.filePath == track.filePath);
-    if (index == -1) return;
-    try {
-      await _player.seek(Duration.zero, index: index);
-      _player.play();
-    } on PlatformException catch (e) {
-      // The native queue can be mid-rebuild (playlist rescan in progress) when the
-      // user taps, so the Dart-side index is momentarily invalid on the native side.
-      debugPrint('playTrack seek failed, queue likely mid-rebuild: $e');
-    }
-  }
-
-  // --- PLAYLIST LOGIC ---
-
-  Future<void> createPlaylist(String name) async {
-    final newPlaylist = Playlist(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
-      name: name,
-      trackFilePaths: [],
-    );
-    _customPlaylists.add(newPlaylist);
-    await _savePlaylists();
+    _rebuildOrder(keepCurrent: true);
     notifyListeners();
   }
 
-  Future<void> addSongToPlaylist(Playlist playlist, AudioMetadata song) async {
-    if (!playlist.trackFilePaths.contains(song.filePath)) {
-      playlist.trackFilePaths.add(song.filePath);
-      await _savePlaylists();
+  void _rebuildOrder({bool keepCurrent = false}) {
+    final indices = List<int>.generate(_playableSongs.length, (i) => i);
+    if (_shuffleEnabled) {
+      indices.shuffle();
+    }
+    final currentIndex = keepCurrent && _currentSong != null ? _playableSongs.indexOf(_currentSong!) : -1;
+    if (currentIndex != -1) {
+      indices
+        ..remove(currentIndex)
+        ..insert(0, currentIndex);
+      _orderPos = 0;
+    } else {
+      _orderPos = -1;
+    }
+    _playOrder = indices;
+  }
+
+  void setShuffleEnabled(bool enabled) {
+    if (_shuffleEnabled == enabled) return;
+    _shuffleEnabled = enabled;
+    _rebuildOrder(keepCurrent: true);
+    notifyListeners();
+  }
+
+  void cycleRepeatMode() {
+    _repeatMode = switch (_repeatMode) {
+      RepeatMode.off => RepeatMode.all,
+      RepeatMode.all => RepeatMode.one,
+      RepeatMode.one => RepeatMode.off,
+    };
+    notifyListeners();
+  }
+
+  Future<void> playTrack(AudioMetadata track) async {
+    final songIndex = _playableSongs.indexWhere((s) => s.filePath == track.filePath);
+    if (songIndex == -1) {
+      debugPrint('playTrack: Song not found in playable list');
+      return;
+    }
+    var orderPos = _playOrder.indexOf(songIndex);
+    if (orderPos == -1) {
+      _rebuildOrder();
+      orderPos = _playOrder.indexOf(songIndex);
+    }
+    _orderPos = orderPos;
+    await _playAtOrderPos();
+  }
+
+  /// Resumes playback, or starts the first track if nothing has been
+  /// selected yet (e.g. a fresh app launch before any tap).
+  Future<void> playOrResume() async {
+    if (_currentHandle == null) {
+      if (_playOrder.isEmpty) _rebuildOrder();
+      if (_playOrder.isEmpty) return;
+      if (_orderPos == -1) _orderPos = 0;
+      await _playAtOrderPos();
+    } else {
+      _soloud.setPause(_currentHandle!, false);
+      _isPlaying = true;
       notifyListeners();
     }
   }
 
-  Future<void> _savePlaylists() async {
-    await _prefs.setString(_prefCustomPlaylistsKey, jsonEncode(_customPlaylists.map((e) => e.toJson()).toList()));
+  void pause() {
+    if (_currentHandle != null) {
+      _soloud.setPause(_currentHandle!, true);
+    }
+    _isPlaying = false;
+    notifyListeners();
+  }
+
+  Future<void> stop() async {
+    _positionTimer?.cancel();
+    if (_currentHandle != null) {
+      await _soloud.stop(_currentHandle!);
+    }
+    _currentHandle = null;
+    _isPlaying = false;
+    _currentPosition = Duration.zero;
+    notifyListeners();
+  }
+
+  void seek(Duration position) {
+    if (_currentHandle != null) {
+      _soloud.seek(_currentHandle!, position);
+      _currentPosition = position;
+    }
+  }
+
+  Future<void> next() async {
+    if (_repeatMode == RepeatMode.one) {
+      await _playAtOrderPos();
+      return;
+    }
+    if (_orderPos + 1 < _playOrder.length) {
+      _orderPos++;
+      await _playAtOrderPos();
+    } else if (_repeatMode == RepeatMode.all && _playOrder.isNotEmpty) {
+      _orderPos = 0;
+      await _playAtOrderPos();
+    } else {
+      await stop();
+    }
+  }
+
+  Future<void> previous() async {
+    if (_currentPosition > const Duration(seconds: 3)) {
+      seek(Duration.zero);
+      return;
+    }
+    if (_orderPos > 0) {
+      _orderPos--;
+      await _playAtOrderPos();
+    } else if (_repeatMode == RepeatMode.all && _playOrder.isNotEmpty) {
+      _orderPos = _playOrder.length - 1;
+      await _playAtOrderPos();
+    } else {
+      seek(Duration.zero);
+    }
+  }
+
+  Future<void> _playAtOrderPos() async {
+    if (_orderPos < 0 || _orderPos >= _playOrder.length) return;
+    final song = _playableSongs[_playOrder[_orderPos]];
+    await _loadAndPlay(song);
+  }
+
+  Future<void> _loadAndPlay(AudioMetadata song) async {
+    _positionTimer?.cancel();
+    final oldHandle = _currentHandle;
+    final oldSource = _currentSource;
+    _currentHandle = null;
+    try {
+      final source = await _soloud.loadFile(song.filePath);
+      final handle = _soloud.play(source);
+      _currentSource = source;
+      _currentHandle = handle;
+      _currentDuration = _soloud.getLength(source);
+      _currentPosition = Duration.zero;
+      _currentSong = song;
+      _isPlaying = true;
+      _prefs.setInt(_prefIndexKey, _playableSongs.indexOf(song));
+      _positionController.add(PositionData(Duration.zero, _currentDuration, _currentDuration));
+      _startPositionTimer();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('_loadAndPlay error: $e');
+    }
+    if (oldHandle != null) {
+      await _soloud.stop(oldHandle);
+    }
+    if (oldSource != null) {
+      await _soloud.disposeSource(oldSource);
+    }
+  }
+
+  void _startPositionTimer() {
+    _positionTimer = Timer.periodic(const Duration(milliseconds: 200), (_) {
+      final handle = _currentHandle;
+      if (handle == null) return;
+      if (!_soloud.getIsValidVoiceHandle(handle)) {
+        _positionTimer?.cancel();
+        next();
+        return;
+      }
+      _currentPosition = _soloud.getPosition(handle);
+      _prefs.setInt(_prefPositionKey, _currentPosition.inMilliseconds);
+      _positionController.add(PositionData(_currentPosition, _currentDuration, _currentDuration));
+    });
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _player.dispose();
+    _positionTimer?.cancel();
+    _positionController.close();
     super.dispose();
   }
 }

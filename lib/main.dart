@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
-import 'package:just_audio_background/just_audio_background.dart';
+import 'package:flutter_soloud/flutter_soloud.dart';
 import 'package:provider/provider.dart';
 import 'package:musix/providers/playback_provider.dart';
+import 'package:musix/services/musix_audio_handler.dart';
 import 'package:musix/musix.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -15,21 +17,31 @@ Future<void> main() async {
     debugPrint('=== SharedPreferences Initialized ===');
 
     try {
-      await JustAudioBackground.init(
-        androidNotificationChannelId: 'com.shuvro.musix',
-        androidNotificationChannelName: 'Musix Playback',
-        androidNotificationOngoing: true,
-      );
-      debugPrint('=== JustAudioBackground Initialized ===');
+      await SoLoud.instance.init();
+      debugPrint('=== SoLoud Initialized ===');
     } catch (e) {
-      debugPrint('=== JustAudioBackground Error: $e ===');
+      debugPrint('=== SoLoud Init Error: $e ===');
+    }
+
+    final provider = PlaybackProvider(prefs);
+
+    try {
+      await AudioService.init(
+        builder: () => MusixAudioHandler(provider),
+        config: const AudioServiceConfig(
+          androidNotificationChannelId: 'com.shuvro.musix',
+          androidNotificationChannelName: 'Musix Playback',
+          androidNotificationOngoing: true,
+        ),
+      );
+      debugPrint('=== AudioService Initialized ===');
+    } catch (e) {
+      debugPrint('=== AudioService Init Error: $e ===');
     }
 
     runApp(
-      MultiProvider(
-        providers: [
-          ChangeNotifierProvider(create: (_) => PlaybackProvider(prefs)),
-        ],
+      ChangeNotifierProvider.value(
+        value: provider,
         child: const MusixApp(),
       ),
     );
