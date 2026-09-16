@@ -47,6 +47,19 @@
 			</array>
 		</dict>
 	</dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>musix-sharing</string>
+			</array>
+		</dict>
+	</array>
+	<key>AppGroupId</key>
+	<string>group.com.shuvro.musix.shared</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UIBackgroundModes</key>
@@ -82,5 +95,7 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+    <key>NSExtensionActivationRule</key>
+    <string>TRUEPREDICATE extensionItems.attachments.registeredTypeIdentifiers CONTAINS "public.url"</string>
 </dict>
 </plist>

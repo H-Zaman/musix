@@ -156,6 +156,8 @@ class PlaybackProvider extends ChangeNotifier {
     }
   }
 
+  Future<void> rescanLibrary() => _autoScanLibrary();
+
   Future<void> importSongs() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.any,

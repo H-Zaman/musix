@@ -5,6 +5,7 @@ import 'package:musix/models/position.dart';
 import 'package:provider/provider.dart';
 import 'package:musix/providers/playback_provider.dart';
 import 'package:musix/theme/winamp_theme.dart';
+import 'package:musix/screens/youtube_downloader_screen.dart';
 
 class MusixPlayerScreen extends StatefulWidget {
   const MusixPlayerScreen({super.key});
@@ -36,6 +37,14 @@ class _MusixPlayerScreenState extends State<MusixPlayerScreen> {
         ),
         title: Text('WINAMP', style: winampColors.statusStyle?.copyWith(fontSize: 16, fontWeight: FontWeight.bold)),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.download, size: 20),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const YoutubeDownloaderScreen()),
+            ),
+            tooltip: 'YouTube Downloader',
+          ),
           if (provider.isScanning)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12.0),
@@ -354,7 +363,8 @@ class WinampEqualizer extends StatefulWidget {
 
 class _WinampEqualizerState extends State<WinampEqualizer> {
   static const int _barCount = 20;
-  List<double> _heights = List.filled(_barCount, 0.0);
+  final List<double> _heights = List.filled(_barCount, 0.0);
+  final List<double> _bandBuffer = List.filled(_barCount, 0.0);
   StreamSubscription<Float32List>? _sub;
 
   @override
@@ -377,14 +387,18 @@ class _WinampEqualizerState extends State<WinampEqualizer> {
       if (!mounted) return;
       if (!widget.isPlaying || fft.isEmpty) {
         if (_heights.any((h) => h > 0.01)) {
-          setState(() => _heights = _heights.map((h) => h * 0.8).toList());
+          setState(() {
+            for (int i = 0; i < _barCount; i++) {
+              _heights[i] *= 0.8;
+            }
+          });
         }
         return;
       }
-      final bands = _toBands(fft);
+      _fillBands(fft);
       setState(() {
         for (int i = 0; i < _barCount; i++) {
-          _heights[i] = _heights[i] * 0.4 + bands[i] * 0.6;
+          _heights[i] = _heights[i] * 0.4 + _bandBuffer[i] * 0.6;
         }
       });
     });
@@ -393,10 +407,12 @@ class _WinampEqualizerState extends State<WinampEqualizer> {
   // ponytail: fixed 6x gain on raw FFT magnitudes to fill the 0..1 bar
   // range; SoLoud's real output level varies by track, so tune this (or
   // normalize against a running max) if bars run too flat or clip.
-  List<double> _toBands(Float32List fft) {
+  void _fillBands(Float32List fft) {
     final usable = fft.length ~/ 2;
-    final bands = List<double>.filled(_barCount, 0.0);
-    if (usable == 0) return bands;
+    if (usable == 0) {
+      _bandBuffer.fillRange(0, _barCount, 0.0);
+      return;
+    }
     for (int i = 0; i < _barCount; i++) {
       final start = (i * usable / _barCount).floor();
       final end = ((i + 1) * usable / _barCount).floor().clamp(start + 1, usable);
@@ -404,9 +420,8 @@ class _WinampEqualizerState extends State<WinampEqualizer> {
       for (int j = start; j < end; j++) {
         sum += fft[j].abs();
       }
-      bands[i] = ((sum / (end - start)) * 6).clamp(0.0, 1.0);
+      _bandBuffer[i] = ((sum / (end - start)) * 6).clamp(0.0, 1.0);
     }
-    return bands;
   }
 
   @override

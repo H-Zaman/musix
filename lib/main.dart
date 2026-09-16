@@ -8,6 +8,8 @@ import 'package:musix/services/musix_audio_handler.dart';
 import 'package:musix/musix.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:musix/providers/youtube_downloader_provider.dart';
+
 Future<void> main() async {
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
@@ -23,11 +25,11 @@ Future<void> main() async {
       debugPrint('=== SoLoud Init Error: $e ===');
     }
 
-    final provider = PlaybackProvider(prefs);
+    final playbackProvider = PlaybackProvider(prefs);
 
     try {
       await AudioService.init(
-        builder: () => MusixAudioHandler(provider),
+        builder: () => MusixAudioHandler(playbackProvider),
         config: const AudioServiceConfig(
           androidNotificationChannelId: 'com.shuvro.musix',
           androidNotificationChannelName: 'Musix Playback',
@@ -40,8 +42,11 @@ Future<void> main() async {
     }
 
     runApp(
-      ChangeNotifierProvider.value(
-        value: provider,
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider.value(value: playbackProvider),
+          ChangeNotifierProvider(create: (_) => YoutubeDownloaderProvider(playbackProvider)),
+        ],
         child: const MusixApp(),
       ),
     );
