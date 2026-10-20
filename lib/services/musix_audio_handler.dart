@@ -17,19 +17,24 @@ class MusixAudioHandler extends BaseAudioHandler {
     if (song != null) {
       mediaItem.add(song.toMediaItem(duration: provider.currentDuration));
     }
-    playbackState.add(playbackState.value.copyWith(
-      controls: [
-        MediaControl.skipToPrevious,
-        provider.isPlaying ? MediaControl.pause : MediaControl.play,
-        MediaControl.stop,
-        MediaControl.skipToNext,
-      ],
-      systemActions: const {MediaAction.seek},
-      androidCompactActionIndices: const [0, 1, 3],
-      processingState: AudioProcessingState.ready,
-      playing: provider.isPlaying,
-      updatePosition: provider.currentPosition,
-    ));
+    playbackState.add(
+      playbackState.value.copyWith(
+        controls: [
+          MediaControl.skipToPrevious,
+          provider.isPlaying ? MediaControl.pause : MediaControl.play,
+          MediaControl.stop,
+          MediaControl.skipToNext,
+        ],
+        systemActions: const {MediaAction.seek},
+        androidCompactActionIndices: const [0, 1, 3],
+        processingState: song == null
+            ? AudioProcessingState.idle
+            : AudioProcessingState.ready,
+        playing: provider.isPlaying,
+        updatePosition: provider.currentPosition,
+                speed: 1.0,
+      ),
+    );
   }
 
   @override

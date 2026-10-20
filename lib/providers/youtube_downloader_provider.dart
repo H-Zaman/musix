@@ -1,14 +1,12 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/material.dart';
+
+import 'package:flutter/foundation.dart';
+import 'package:musix/config/api_config.dart';
 import 'package:musix/models/youtube_job.dart';
 import 'package:musix/services/youtube_api_service.dart';
-import 'package:musix/musix.dart';
-import 'package:musix/screens/youtube_downloader_screen.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
-
-import 'package:musix/providers/playback_provider.dart';
 
 enum DownloaderState {
   idle,
@@ -19,191 +17,248 @@ enum DownloaderState {
   failed,
 }
 
+const _youtubeHosts = {
+  'youtube.com',
+  'www.youtube.com',
+  'm.youtube.com',
+  'music.youtube.com',
+  'youtu.be',
+};
+
+/// Pulls the first YouTube link out of [text] and returns it as a validated
+/// https URL, or null when there is none.
+String? extractYoutubeUrl(String text) {
+  final match = RegExp(
+    r'(?:https?://)?(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/[^\s]+',
+    caseSensitive: false,
+  ).firstMatch(text);
+  if (match == null) return null;
+
+  var candidate = match.group(0)!;
+  if (!candidate.toLowerCase().startsWith('http')) {
+    candidate = 'https://$candidate';
+  }
+  final uri = Uri.tryParse(candidate);
+  if (uri == null || !_youtubeHosts.contains(uri.host.toLowerCase())) {
+    return null;
+  }
+  return uri.replace(scheme: 'https').toString();
+}
+
 class YoutubeDownloaderProvider extends ChangeNotifier {
-  final YoutubeApiService _apiService = YoutubeApiService();
-  final PlaybackProvider _playbackProvider;
-  
+  static const _maxPollAttempts = 150; // 5 minutes at 2s
+  static const _pollInterval = Duration(seconds: 2);
+
+  final YoutubeApi _api;
+  final Future<void> Function() _onDownloaded;
+  final VoidCallback? _onOpenScreen;
+  final Duration _pollDelay;
+  StreamSubscription<List<SharedMediaFile>>? _shareSub;
+
   DownloaderState _state = DownloaderState.idle;
   YoutubeJob? _currentJob;
   String? _errorMessage;
   File? _downloadedFile;
-  Timer? _pollingTimer;
+  double _downloadProgress = 0;
+  // Bumped on every reset/dispose; async work compares it after each await
+  // so a cancelled or replaced job can't write stale state.
+  int _generation = 0;
+  bool _disposed = false;
 
   DownloaderState get state => _state;
   YoutubeJob? get currentJob => _currentJob;
   String? get errorMessage => _errorMessage;
   File? get downloadedFile => _downloadedFile;
+  double get downloadProgress => _downloadProgress;
 
-  YoutubeDownloaderProvider(this._playbackProvider) {
-    _initSharingListener();
+  YoutubeDownloaderProvider({
+    required this._onDownloaded,
+    this._onOpenScreen,
+    YoutubeApi? api,
+    bool listenForShares = true,
+    @visibleForTesting this._pollDelay = _pollInterval,
+  }) : _api = api ?? YoutubeApiService() {
+    if (listenForShares) _initSharingListener();
   }
 
   void _initSharingListener() {
-    // For sharing or opening urls/text while app is in background or foreground
-    ReceiveSharingIntent.instance.getMediaStream().listen((List<SharedMediaFile> value) {
-      if (value.isNotEmpty) {
-        final url = _extractUrl(value.first.path);
-        if (url != null) {
-          startJob(url);
-        }
-      }
-    }, onError: (err) {
-      debugPrint("getMediaStream error: $err");
-    });
+    // Links shared while the app is in background or foreground.
+    _shareSub = ReceiveSharingIntent.instance.getMediaStream().listen(
+      _handleShared,
+      onError: (Object err) => debugPrint('getMediaStream error: $err'),
+    );
 
-    // For sharing or opening urls/text while app is closed. Must be reset
-    // after handling, otherwise the same shared link replays on every
-    // subsequent cold launch and silently restarts an old download job.
-    ReceiveSharingIntent.instance.getInitialMedia().then((List<SharedMediaFile> value) {
-      if (value.isNotEmpty) {
-        final url = _extractUrl(value.first.path);
-        if (url != null) {
-          startJob(url);
-        }
-      }
-      ReceiveSharingIntent.instance.reset();
-    });
+    // Links shared while the app is closed. Must be reset after handling,
+    // otherwise the same link replays on every cold launch.
+    ReceiveSharingIntent.instance
+        .getInitialMedia()
+        .then((value) {
+          _handleShared(value);
+          ReceiveSharingIntent.instance.reset();
+        })
+        .catchError((Object err) {
+          debugPrint('getInitialMedia error: $err');
+        });
   }
 
-  String? _extractUrl(String text) {
-    final urlRegExp = RegExp(
-        r'((https?://)?(www\.)?(youtube\.com|youtu\.be|youtube\.com/shorts)/[^\s]+)');
-    final match = urlRegExp.firstMatch(text);
-    return match?.group(0);
+  void _handleShared(List<SharedMediaFile> files) {
+    if (files.isEmpty) return;
+    final url = extractYoutubeUrl(files.first.path);
+    if (url != null) startJob(url);
   }
 
-  void _navigateToDownloader() {
-    final context = MusixApp.navigatorKey.currentContext;
-    if (context != null) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => const YoutubeDownloaderScreen()),
-      );
-    }
-  }
-
-  Future<void> startJob(String url) async {
-    if (url.isEmpty || !url.contains('youtu')) {
+  Future<void> startJob(String input) async {
+    final url = extractYoutubeUrl(input);
+    if (url == null) {
       _setError('Please enter a valid YouTube URL');
       return;
     }
 
-    _navigateToDownloader();
-    _reset();
+    final previous = _currentJob;
+    _onOpenScreen?.call();
+    final gen = _reset();
+    if (previous != null && !previous.isFinal) {
+      unawaited(_cancelQuietly(previous.id));
+    }
     _state = DownloaderState.creating;
     notifyListeners();
 
     try {
-      _currentJob = await _apiService.createJob(url);
+      final job = await _api.createJob(url);
+      if (gen != _generation) {
+        unawaited(_cancelQuietly(job.id));
+        return;
+      }
+      _currentJob = job;
       _state = DownloaderState.processing;
       notifyListeners();
-      _startPolling();
-    } catch (e) {
-      _setError('Failed to connect to backend. It might be waking up...');
+      await _pollLoop(gen, job.id);
+    } on Exception catch (e) {
+      debugPrint('startJob failed: $e');
+      if (gen == _generation) {
+        _setError(
+          'Could not reach the backend at ${ApiConfig.baseUrl}. '
+          'It may be offline or waking up.',
+        );
+      }
     }
   }
 
-  static const _maxPollAttempts = 300; // 5 minutes at 1s interval
-  int _pollAttempts = 0;
-
-  void _startPolling() {
-    _pollingTimer?.cancel();
-    _pollAttempts = 0;
-    _pollingTimer = Timer.periodic(const Duration(seconds: 10), (timer) async {
-      if (_currentJob == null) {
-        timer.cancel();
-        return;
-      }
-      if (++_pollAttempts > _maxPollAttempts) {
-        timer.cancel();
-        _setError('Timed out waiting for the backend to finish processing');
-        return;
-      }
-
+  // Chained (not Timer.periodic) so a slow status call can't overlap the
+  // next tick.
+  Future<void> _pollLoop(int gen, String jobId) async {
+    for (var attempt = 0; attempt < _maxPollAttempts; attempt++) {
+      await Future<void>.delayed(_pollDelay);
+      if (gen != _generation) return;
       try {
-        final updatedJob = await _apiService.getJobStatus(_currentJob!.id);
-        _currentJob = updatedJob;
-        
-        if (updatedJob.status == YoutubeJobStatus.completed) {
-          timer.cancel();
-          _downloadFile();
-        } else if (updatedJob.status == YoutubeJobStatus.failed) {
-          timer.cancel();
-          _setError(updatedJob.error ?? 'Backend processing failed');
-        } else if (updatedJob.status == YoutubeJobStatus.cancelled) {
-          timer.cancel();
-          _state = DownloaderState.idle;
+        final job = await _api.getJobStatus(jobId);
+        if (gen != _generation) return;
+        _currentJob = job;
+        switch (job.status) {
+          case YoutubeJobStatus.completed:
+            notifyListeners();
+            await _downloadFile(gen, job);
+            return;
+          case YoutubeJobStatus.failed:
+            _setError(job.error ?? 'Backend processing failed');
+            return;
+          case YoutubeJobStatus.cancelled:
+            _state = DownloaderState.idle;
+            notifyListeners();
+            return;
+          case YoutubeJobStatus.queued:
+          case YoutubeJobStatus.fetchingMetadata:
+          case YoutubeJobStatus.downloading:
+          case YoutubeJobStatus.converting:
+            notifyListeners();
         }
-        
-        notifyListeners();
-      } catch (e) {
+      } on Exception catch (e) {
+        // A single network error shouldn't end the job; retry next tick.
         debugPrint('Polling error: $e');
-        // We don't stop on a single network error, just wait for next tick
       }
-    });
+    }
+    if (gen == _generation) {
+      _setError('Timed out waiting for the backend to finish processing');
+    }
   }
 
-  Future<void> _downloadFile() async {
-    if (_currentJob == null) return;
-    
+  Future<void> _downloadFile(int gen, YoutubeJob job) async {
     _state = DownloaderState.downloadingFile;
+    _downloadProgress = 0;
     notifyListeners();
 
     try {
-      _downloadedFile = await _apiService.downloadMp3(_currentJob!);
+      final file = await _api.downloadMp3(
+        job,
+        onProgress: (fraction) {
+          if (gen != _generation) return;
+          _downloadProgress = fraction;
+          notifyListeners();
+        },
+      );
+      if (gen != _generation) return;
+      _downloadedFile = file;
       _state = DownloaderState.completed;
       notifyListeners();
-      
-      // Trigger a rescan of the library so the new song shows up instantly
-      // We wait a tiny bit to ensure File I/O is finalized by OS
-      Future.delayed(const Duration(milliseconds: 500), () {
-        _playbackProvider.rescanLibrary();
-      });
-    } catch (e) {
-      _setError('Download failed while saving the file');
+      // Rescan so the new song shows up immediately.
+      await _onDownloaded();
+    } on Exception catch (e) {
+      debugPrint('Download failed: $e');
+      if (gen == _generation) {
+        _setError('Download failed while saving the file');
+      }
     }
   }
 
   Future<void> cancelJob() async {
-    if (_currentJob == null) return;
-
-    _pollingTimer?.cancel();
-    final jobId = _currentJob!.id;
+    final job = _currentJob;
+    if (job == null) return;
     _reset();
     notifyListeners();
+    await _cancelQuietly(job.id);
+  }
 
+  Future<void> _cancelQuietly(String jobId) async {
     try {
-      await _apiService.cancelJob(jobId);
-    } catch (e) {
+      await _api.cancelJob(jobId);
+    } on Exception catch (e) {
       debugPrint('Cancel request failed: $e');
     }
   }
 
   void shareFile() {
-    if (_downloadedFile != null) {
-      Share.shareXFiles([XFile(_downloadedFile!.path)]);
+    final file = _downloadedFile;
+    if (file != null) {
+      Share.shareXFiles([XFile(file.path)]);
     }
   }
 
   void _setError(String message) {
     _state = DownloaderState.failed;
     _errorMessage = message;
-    _pollingTimer?.cancel();
     notifyListeners();
   }
 
-  void _reset() {
+  int _reset() {
     _state = DownloaderState.idle;
     _currentJob = null;
     _errorMessage = null;
     _downloadedFile = null;
-    _pollingTimer?.cancel();
+    _downloadProgress = 0;
+    return ++_generation;
+  }
+
+  @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
   }
 
   @override
   void dispose() {
-    _pollingTimer?.cancel();
-    _apiService.dispose();
+    _disposed = true;
+    _generation++;
+    _shareSub?.cancel();
+    _api.dispose();
     super.dispose();
   }
 }

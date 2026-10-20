@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+
 import 'package:audio_session/audio_session.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -32,15 +33,20 @@ class PlaybackProvider extends ChangeNotifier {
   bool _shuffleEnabled = false;
   RepeatMode _repeatMode = RepeatMode.off;
   Timer? _positionTimer;
-  final StreamController<PositionData> _positionController = StreamController.broadcast();
+  final StreamController<PositionData> _positionController =
+      StreamController.broadcast();
+  StreamSubscription<AudioInterruptionEvent>? _interruptionSub;
+  StreamSubscription<void>? _noisySub;
+  bool _resumeAfterInterruption = false;
+  // Bumped per load request so overlapping taps can't start two sources.
+  int _loadToken = 0;
 
   bool _isScanning = false;
   final SharedPreferences _prefs;
   String _searchQuery = '';
 
   static const String _prefSongsKey = 'musix_all_songs';
-  static const String _prefIndexKey = 'musix_current_index';
-  static const String _prefPositionKey = 'musix_position';
+  static const _audioExtensions = ['.mp3', '.m4a', '.wav', '.aac', '.flac'];
 
   List<AudioMetadata> get filteredSongs => _filteredSongs;
   bool get isScanning => _isScanning;
@@ -52,22 +58,41 @@ class PlaybackProvider extends ChangeNotifier {
   Duration get currentDuration => _currentDuration;
   Duration get currentPosition => _currentPosition;
   bool get hasPrevious => _orderPos > 0 || _repeatMode == RepeatMode.all;
-  bool get hasNext => _orderPos + 1 < _playOrder.length || _repeatMode == RepeatMode.all;
-  int? get currentDisplayIndex => _currentSong == null ? null : _playableSongs.indexOf(_currentSong!) + 1;
+  bool get hasNext =>
+      _orderPos + 1 < _playOrder.length || _repeatMode == RepeatMode.all;
+  int? get currentDisplayIndex =>
+      _currentSong == null ? null : _playableIndexOf(_currentSong!) + 1;
 
   Stream<PositionData> get positionDataStream => _positionController.stream;
-  Stream<Float32List> get fftStream =>
-      _soloud.audioVisualizationEvents.map((d) => d.fftData ?? Float32List(0));
+
+  // Built once: widgets compare this stream by identity in didUpdateWidget,
+  // so a getter returning a fresh .map() each time resubscribed every rebuild.
+  late final Stream<Float32List> fftStream = _soloud.audioVisualizationEvents
+      .map((d) => d.fftData ?? Float32List(0))
+      .asBroadcastStream();
 
   PlaybackProvider(this._prefs) {
     _initEngine();
     _loadInitialState();
   }
 
+  int _playableIndexOf(AudioMetadata song) =>
+      _playableSongs.indexWhere((s) => s.filePath == song.filePath);
+
   Future<void> _initEngine() async {
     try {
       final session = await AudioSession.instance;
       await session.configure(const AudioSessionConfiguration.music());
+      _interruptionSub = session.interruptionEventStream.listen((event) {
+        if (event.begin) {
+          _resumeAfterInterruption = _isPlaying;
+          if (_isPlaying) pause();
+        } else if (_resumeAfterInterruption) {
+          _resumeAfterInterruption = false;
+          unawaited(playOrResume());
+        }
+      });
+      _noisySub = session.becomingNoisyEventStream.listen((_) => pause());
     } catch (e) {
       debugPrint('Audio session config error: $e');
     }
@@ -84,14 +109,22 @@ class PlaybackProvider extends ChangeNotifier {
   Future<void> _loadInitialState() async {
     final songsJson = _prefs.getString(_prefSongsKey);
     if (songsJson != null) {
-      final List<dynamic> decoded = jsonDecode(songsJson);
-      _allSongs.clear();
-      _allSongs.addAll(decoded.map((e) => AudioMetadata.fromJson(e)));
-      _applyFilter();
-      _updatePlayableSongs(_allSongs);
+      try {
+        final List<dynamic> decoded = jsonDecode(songsJson);
+        _allSongs
+          ..clear()
+          ..addAll(decoded.map((e) => AudioMetadata.fromJson(e)));
+        _applyFilter();
+        await _updatePlayableSongs(_allSongs);
+      } catch (e) {
+        // Corrupt cache: drop it, the scan below rebuilds the library.
+        debugPrint('Ignoring unreadable song cache: $e');
+        _allSongs.clear();
+        await _prefs.remove(_prefSongsKey);
+      }
     }
     notifyListeners();
-    _autoScanLibrary();
+    await _autoScanLibrary();
   }
 
   void setSearchQuery(String query) {
@@ -104,8 +137,9 @@ class PlaybackProvider extends ChangeNotifier {
     if (_searchQuery.isEmpty) {
       _filteredSongs = List.from(_allSongs);
     } else {
+      final q = _searchQuery.toLowerCase();
       _filteredSongs = _allSongs
-          .where((song) => song.title.toLowerCase().contains(_searchQuery.toLowerCase()))
+          .where((song) => song.title.toLowerCase().contains(q))
           .toList();
     }
   }
@@ -120,18 +154,22 @@ class PlaybackProvider extends ChangeNotifier {
       final List<AudioMetadata> foundSongs = [];
 
       if (await docsDir.exists()) {
-        final entities = docsDir.listSync(recursive: true, followLinks: false);
-        for (var entity in entities) {
-          if (entity is File) {
-            final ext = p.extension(entity.path).toLowerCase();
-            if (['.mp3', '.m4a', '.wav', '.aac', '.flac'].contains(ext)) {
-              foundSongs.add(AudioMetadata(
+        final entities = await docsDir
+            .list(recursive: true, followLinks: false)
+            .toList();
+        for (final entity in entities) {
+          if (entity is File &&
+              _audioExtensions.contains(
+                p.extension(entity.path).toLowerCase(),
+              )) {
+            foundSongs.add(
+              AudioMetadata(
                 title: p.basenameWithoutExtension(entity.path),
                 artist: 'Local Artist',
                 album: p.basename(p.dirname(entity.path)),
                 filePath: entity.path,
-              ));
-            }
+              ),
+            );
           }
         }
       }
@@ -139,14 +177,21 @@ class PlaybackProvider extends ChangeNotifier {
       // Always trust the fresh scan: cached paths reference the app's sandbox
       // container UUID, which changes across rebuilds/reinstalls on iOS, so a
       // matching count doesn't mean the cached paths are still valid.
-      final samePaths = foundSongs.length == _allSongs.length &&
-          foundSongs.every((s) => _allSongs.any((a) => a.filePath == s.filePath));
+      final samePaths =
+          foundSongs.length == _allSongs.length &&
+          foundSongs.every(
+            (s) => _allSongs.any((a) => a.filePath == s.filePath),
+          );
       if (!samePaths) {
-        _allSongs.clear();
-        _allSongs.addAll(foundSongs);
+        _allSongs
+          ..clear()
+          ..addAll(foundSongs);
         _applyFilter();
-        await _prefs.setString(_prefSongsKey, jsonEncode(_allSongs.map((e) => e.toJson()).toList()));
-        _updatePlayableSongs(_allSongs);
+        await _prefs.setString(
+          _prefSongsKey,
+          jsonEncode(_allSongs.map((e) => e.toJson()).toList()),
+        );
+        await _updatePlayableSongs(_allSongs);
       }
     } catch (e) {
       debugPrint('Library scan error: $e');
@@ -160,33 +205,44 @@ class PlaybackProvider extends ChangeNotifier {
 
   Future<void> importSongs() async {
     final result = await FilePicker.platform.pickFiles(
-      type: FileType.any,
+      type: FileType.audio,
       allowMultiple: true,
     );
-    if (result != null) {
-      final docsDir = await pp.getApplicationDocumentsDirectory();
-      for (var file in result.files) {
-        if (file.path != null) {
-          final newPath = p.join(docsDir.path, file.name);
-          if (!file.path!.startsWith(docsDir.path)) {
-            final sourceFile = File(file.path!);
-            await sourceFile.copy(newPath);
-            try {
-              if (await sourceFile.exists()) {
-                await sourceFile.delete();
-              }
-            } catch (e) {
-              debugPrint('Note: System handled or cloud-synced files do not allow direct app deletion: $e');
-            }
-          }
-        }
-      }
-      await _autoScanLibrary();
+    if (result == null) return;
+
+    final docsDir = await pp.getApplicationDocumentsDirectory();
+    for (final file in result.files) {
+      final path = file.path;
+      if (path == null || path.startsWith(docsDir.path)) continue;
+      await File(path).copy(await _uniquePath(docsDir.path, file.name));
     }
+    // Removes only the picker's own cache copies, never the originals.
+    try {
+      await FilePicker.platform.clearTemporaryFiles();
+    } catch (e) {
+      debugPrint('Picker cache cleanup skipped: $e');
+    }
+    await _autoScanLibrary();
   }
 
-  void _updatePlayableSongs(List<AudioMetadata> songs) {
-    _playableSongs = songs.where((s) => File(s.filePath).existsSync()).toList();
+  Future<String> _uniquePath(String dir, String name) async {
+    final base = p.basenameWithoutExtension(name);
+    final ext = p.extension(name);
+    var candidate = p.join(dir, name);
+    for (var i = 1; await File(candidate).exists(); i++) {
+      candidate = p.join(dir, '$base ($i)$ext');
+    }
+    return candidate;
+  }
+
+  Future<void> _updatePlayableSongs(List<AudioMetadata> songs) async {
+    final exists = await Future.wait(
+      songs.map((s) => File(s.filePath).exists()),
+    );
+    _playableSongs = [
+      for (var i = 0; i < songs.length; i++)
+        if (exists[i]) songs[i],
+    ];
     _rebuildOrder(keepCurrent: true);
     notifyListeners();
   }
@@ -196,7 +252,9 @@ class PlaybackProvider extends ChangeNotifier {
     if (_shuffleEnabled) {
       indices.shuffle();
     }
-    final currentIndex = keepCurrent && _currentSong != null ? _playableSongs.indexOf(_currentSong!) : -1;
+    final currentIndex = keepCurrent && _currentSong != null
+        ? _playableIndexOf(_currentSong!)
+        : -1;
     if (currentIndex != -1) {
       indices
         ..remove(currentIndex)
@@ -225,7 +283,9 @@ class PlaybackProvider extends ChangeNotifier {
   }
 
   Future<void> playTrack(AudioMetadata track) async {
-    final songIndex = _playableSongs.indexWhere((s) => s.filePath == track.filePath);
+    final songIndex = _playableSongs.indexWhere(
+      (s) => s.filePath == track.filePath,
+    );
     if (songIndex == -1) {
       debugPrint('playTrack: Song not found in playable list');
       return;
@@ -263,6 +323,7 @@ class PlaybackProvider extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    _loadToken++;
     _positionTimer?.cancel();
     if (_currentHandle != null) {
       await _soloud.stop(_currentHandle!);
@@ -274,10 +335,15 @@ class PlaybackProvider extends ChangeNotifier {
   }
 
   void seek(Duration position) {
-    if (_currentHandle != null) {
-      _soloud.seek(_currentHandle!, position);
-      _currentPosition = position;
-    }
+    final handle = _currentHandle;
+    if (handle == null) return;
+    _soloud.seek(handle, position);
+    _currentPosition = position;
+    // The position timer only ticks while playing; push the new value so the
+    // slider and notification follow a seek made while paused.
+    _positionController.add(
+      PositionData(position, _currentDuration, _currentDuration),
+    );
   }
 
   Future<void> next() async {
@@ -319,12 +385,25 @@ class PlaybackProvider extends ChangeNotifier {
   }
 
   Future<void> _loadAndPlay(AudioMetadata song) async {
+    final token = ++_loadToken;
     _positionTimer?.cancel();
+
+    // Release the previous track first so a superseded load can't leave an
+    // orphaned voice playing.
     final oldHandle = _currentHandle;
     final oldSource = _currentSource;
     _currentHandle = null;
+    _currentSource = null;
+    if (oldHandle != null) await _soloud.stop(oldHandle);
+    if (oldSource != null) await _soloud.disposeSource(oldSource);
+    if (token != _loadToken) return;
+
     try {
       final source = await _soloud.loadFile(song.filePath);
+      if (token != _loadToken) {
+        await _soloud.disposeSource(source);
+        return;
+      }
       final handle = _soloud.play(source);
       _currentSource = source;
       _currentHandle = handle;
@@ -332,19 +411,16 @@ class PlaybackProvider extends ChangeNotifier {
       _currentPosition = Duration.zero;
       _currentSong = song;
       _isPlaying = true;
-      _prefs.setInt(_prefIndexKey, _playableSongs.indexOf(song));
-      _positionController.add(PositionData(Duration.zero, _currentDuration, _currentDuration));
+      _positionController.add(
+        PositionData(Duration.zero, _currentDuration, _currentDuration),
+      );
       _startPositionTimer();
-      notifyListeners();
     } catch (e) {
+      // Don't claim to be playing a track that failed to load.
       debugPrint('_loadAndPlay error: $e');
+      _isPlaying = false;
     }
-    if (oldHandle != null) {
-      await _soloud.stop(oldHandle);
-    }
-    if (oldSource != null) {
-      await _soloud.disposeSource(oldSource);
-    }
+    notifyListeners();
   }
 
   void _startPositionTimer() {
@@ -353,18 +429,21 @@ class PlaybackProvider extends ChangeNotifier {
       if (handle == null) return;
       if (!_soloud.getIsValidVoiceHandle(handle)) {
         _positionTimer?.cancel();
-        next();
+        unawaited(next());
         return;
       }
       _currentPosition = _soloud.getPosition(handle);
-      _prefs.setInt(_prefPositionKey, _currentPosition.inMilliseconds);
-      _positionController.add(PositionData(_currentPosition, _currentDuration, _currentDuration));
+      _positionController.add(
+        PositionData(_currentPosition, _currentDuration, _currentDuration),
+      );
     });
   }
 
   @override
   void dispose() {
     _positionTimer?.cancel();
+    _interruptionSub?.cancel();
+    _noisySub?.cancel();
     _positionController.close();
     super.dispose();
   }

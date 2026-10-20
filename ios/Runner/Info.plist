@@ -70,6 +70,13 @@
 	<string>Musix needs access to your media library to play local audio files.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Musix needs access to your library to pick audio files.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Musix connects to your download backend on the local network.</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
