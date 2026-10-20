@@ -1,63 +1,67 @@
 import UIKit
-import Social
-import MobileCoreServices
+import UniformTypeIdentifiers
 
-class ShareViewController: UIViewController {
+/// Receives a link shared from YouTube, leaves it for the main app in the
+/// shared App Group, then opens the app so it can start the download.
+/// The app reads `pendingYouTubeURL` (see lib/services/shared_link_inbox.dart).
+final class ShareViewController: UIViewController {
+    private let appGroup = "group.com.shuvro.musix.shared"
+    private let pendingKey = "pendingYouTubeURL"
+    private let hostScheme = "musix-sharing://share"
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        handleSharedURL()
+        view.backgroundColor = .clear
+        loadSharedText { [weak self] text in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let text, !text.isEmpty else { return self.finish() }
+                self.store(text)
+                self.openHostApp()
+            }
+        }
     }
 
-    private func handleSharedURL() {
-        guard let extensionItem = extensionContext?.inputItems.first as? NSExtensionItem,
-              let attachment = extensionItem.attachments?.first else {
-            self.exit()
-            return
-        }
+    /// A web URL if there is one, otherwise plain text that may contain a link.
+    private func loadSharedText(completion: @escaping (String?) -> Void) {
+        let items = extensionContext?.inputItems as? [NSExtensionItem] ?? []
+        let providers = items.flatMap { $0.attachments ?? [] }
 
-        if attachment.hasItemConformingToTypeIdentifier(kUTTypeURL as String) {
-            attachment.loadItem(forTypeIdentifier: kUTTypeURL as String, options: nil) { (url, error) in
-                if let sharedURL = url as? URL {
-                    self.saveToAppGroup(url: sharedURL)
-                    self.redirectToMainApp()
-                } else {
-                    self.exit()
-                }
+        if let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.url.identifier) }) {
+            provider.loadItem(forTypeIdentifier: UTType.url.identifier) { item, _ in
+                completion((item as? URL)?.absoluteString ?? (item as? String))
+            }
+        } else if let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) }) {
+            provider.loadItem(forTypeIdentifier: UTType.plainText.identifier) { item, _ in
+                completion(item as? String)
             }
         } else {
-            self.exit()
+            completion(nil)
         }
     }
 
-    private func saveToAppGroup(url: URL) {
-        // Use the App Group ID defined in Signing & Capabilities
-        if let userDefaults = UserDefaults(suiteName: "group.com.shuvro.musix.shared") {
-            userDefaults.set(url.absoluteString, forKey: "pendingYouTubeURL")
-            userDefaults.synchronize()
-        }
+    private func store(_ text: String) {
+        let defaults = UserDefaults(suiteName: appGroup)
+        defaults?.set(text, forKey: pendingKey)
+        defaults?.synchronize()
     }
 
-    private func redirectToMainApp() {
-        // Custom URL scheme to trigger app open
-        let urlScheme = URL(string: "musix-sharing://")!
-
+    /// Share extensions have no public API to open the host app; on iOS 18+
+    /// going through the responder chain's UIApplication is what works.
+    private func openHostApp() {
+        guard let url = URL(string: hostScheme) else { return finish() }
         var responder: UIResponder? = self
-        while responder != nil {
-            if let application = responder as? UIApplication {
-                application.open(urlScheme, options: [:], completionHandler: { _ in
-                    self.exit()
-                })
+        while let current = responder {
+            if let application = current as? UIApplication {
+                application.open(url, options: [:]) { [weak self] _ in self?.finish() }
                 return
             }
-            responder = responder?.next
+            responder = current.next
         }
-
-        // Fallback
-        self.exit()
+        finish()
     }
 
-    private func exit() {
-        self.extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+    private func finish() {
+        extensionContext?.completeRequest(returningItems: nil, completionHandler: nil)
     }
 }

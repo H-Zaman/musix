@@ -25,8 +25,9 @@ class DebugLog {
         mode: mode,
         flush: true,
       );
-    } on Exception {
-      // Logging must never break a download.
+    } catch (_) {
+      // Deliberately broad: logging must never break a download, and plugin
+      // failures before the binding exists surface as Errors, not Exceptions.
     }
   }
 }

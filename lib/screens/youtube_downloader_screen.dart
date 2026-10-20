@@ -15,6 +15,7 @@ class YoutubeDownloaderScreen extends StatefulWidget {
 
 class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
   final TextEditingController _urlController = TextEditingController();
+  String? _syncedUrl;
 
   @override
   void dispose() {
@@ -33,6 +34,15 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
   Widget build(BuildContext context) {
     final winampColors = Theme.of(context).extension<WinampColors>()!;
     final downloader = Provider.of<YoutubeDownloaderProvider>(context);
+
+    // A link shared from YouTube (or a new job) gets pasted into the field.
+    final sharedUrl = downloader.lastUrl;
+    if (sharedUrl != null && sharedUrl != _syncedUrl) {
+      _syncedUrl = sharedUrl;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _urlController.text = sharedUrl;
+      });
+    }
 
     return Scaffold(
       appBar: AppBar(

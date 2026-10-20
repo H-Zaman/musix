@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:musix/models/youtube_job.dart';
 import 'package:musix/providers/youtube_downloader_provider.dart';
 import 'package:musix/services/on_device_downloader.dart';
+import 'package:musix/services/shared_link_inbox.dart';
 import 'package:musix/services/youtube_api_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -64,6 +65,18 @@ class FakeYoutubeApi implements YoutubeApi {
 
   @override
   void dispose() {}
+}
+
+class FakeInbox implements SharedLinkInbox {
+  String? pending;
+  FakeInbox(this.pending);
+
+  @override
+  Future<String?> take() async {
+    final p = pending;
+    pending = null;
+    return p;
+  }
 }
 
 class FakeOnDevice implements OnDeviceDownloads {
@@ -309,6 +322,53 @@ void main() {
         expect(api.cancelled, ['job1']);
       },
     );
+  });
+
+  group('shared link inbox', () {
+    Future<YoutubeDownloaderProvider> withInbox(
+      FakeInbox inbox,
+      FakeOnDevice onDevice,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      return YoutubeDownloaderProvider(
+        api: FakeYoutubeApi(),
+        onDevice: onDevice,
+        inbox: inbox,
+        prefs: await SharedPreferences.getInstance(),
+        downloadDir: () async => Directory('/tmp'),
+        onDownloaded: () async {},
+        listenForShares: false,
+        pollDelay: Duration.zero,
+      );
+    }
+
+    test('a shared link starts the download and fills the field', () async {
+      final onDevice = FakeOnDevice();
+      final p = await withInbox(
+        FakeInbox('Check this out https://youtu.be/abc123?si=x'),
+        onDevice,
+      );
+
+      await p.checkSharedInbox();
+
+      expect(p.lastUrl, 'https://youtu.be/abc123?si=x');
+      expect(onDevice.calls, 1);
+      expect(p.state, DownloaderState.completed);
+
+      // one-shot: nothing left to replay
+      await p.checkSharedInbox();
+      expect(onDevice.calls, 1);
+    });
+
+    test('shared text without a YouTube link is ignored', () async {
+      final onDevice = FakeOnDevice();
+      final p = await withInbox(FakeInbox('hello there'), onDevice);
+
+      await p.checkSharedInbox();
+
+      expect(onDevice.calls, 0);
+      expect(p.state, DownloaderState.idle);
+    });
   });
 
   group('backend settings', () {

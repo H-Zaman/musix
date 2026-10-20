@@ -39,7 +39,7 @@ class _MusixPlayerScreenState extends State<MusixPlayerScreen> {
           child: Icon(Icons.music_note, color: winampColors.textGreen),
         ),
         title: Text(
-          'WINAMP',
+          'MUSIX',
           style: winampColors.statusStyle?.copyWith(
             fontSize: 16,
             fontWeight: FontWeight.bold,
@@ -143,7 +143,7 @@ class _MusixPlayerScreenState extends State<MusixPlayerScreen> {
     final displayIndex = provider.currentDisplayIndex;
     final titleText = hasTrack
         ? '$displayIndex. ${provider.currentSong!.title}'
-        : '*** WINAMP: SPARKING THE APP ***';
+        : '*** MUSIX ***';
 
     return Container(
       decoration: BoxDecoration(

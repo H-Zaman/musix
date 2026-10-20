@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:musix/config/api_config.dart';
 import 'package:musix/models/youtube_job.dart';
+import 'package:musix/services/debug_log.dart';
 import 'package:musix/services/on_device_downloader.dart';
+import 'package:musix/services/shared_link_inbox.dart';
 import 'package:musix/services/youtube_api_service.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -65,7 +67,10 @@ class YoutubeDownloaderProvider extends ChangeNotifier {
   final Future<void> Function() _onDownloaded;
   final VoidCallback? _onOpenScreen;
   final Duration _pollDelay;
+  final SharedLinkInbox _inbox;
+  AppLifecycleListener? _lifecycle;
   StreamSubscription<List<SharedMediaFile>>? _shareSub;
+  String? _lastUrl;
 
   DownloaderState _state = DownloaderState.idle;
   YoutubeJob? _currentJob;
@@ -86,6 +91,9 @@ class YoutubeDownloaderProvider extends ChangeNotifier {
   String? get errorMessage => _errorMessage;
   File? get downloadedFile => _downloadedFile;
   double get downloadProgress => _downloadProgress;
+
+  /// The link of the latest job; the screen shows it in the URL field.
+  String? get lastUrl => _lastUrl;
   String get backendUrl => _backendConfigured ? _api.baseUrl : '';
   String get apiKey => _api.apiKey;
   bool get testingBackend => _testingBackend;
@@ -110,15 +118,25 @@ class YoutubeDownloaderProvider extends ChangeNotifier {
     OnDeviceDownloads? onDevice,
     Future<Directory> Function()? downloadDir,
     bool listenForShares = true,
+    SharedLinkInbox? inbox,
     @visibleForTesting this._pollDelay = _pollInterval,
   }) : _api = api ?? YoutubeApiService(),
        _onDevice = onDevice ?? OnDeviceDownloader(),
-       _downloadDir = downloadDir ?? getApplicationDocumentsDirectory {
+       _downloadDir = downloadDir ?? getApplicationDocumentsDirectory,
+       _inbox = inbox ?? AppGroupLinkInbox() {
     _api.configure(
       baseUrl: _prefs?.getString(_prefUrlKey),
       apiKey: _prefs?.getString(_prefKeyKey),
     );
-    if (listenForShares) _initSharingListener();
+    if (listenForShares) {
+      _initSharingListener();
+      // iOS share extension: pick the link up now and whenever the app
+      // comes back to the foreground (the extension opens the app).
+      _lifecycle = AppLifecycleListener(
+        onResume: () => unawaited(checkSharedInbox()),
+      );
+      unawaited(checkSharedInbox());
+    }
   }
 
   void _initSharingListener() {
@@ -141,6 +159,23 @@ class YoutubeDownloaderProvider extends ChangeNotifier {
         });
   }
 
+  /// Starts a download for a link waiting in the share inbox, if any.
+  Future<void> checkSharedInbox() async {
+    final String? shared;
+    try {
+      shared = await _inbox.take();
+    } on Exception catch (e) {
+      DebugLog.add('share inbox unreadable: $e');
+      return;
+    }
+    if (shared == null) return;
+    final url = extractYoutubeUrl(shared);
+    DebugLog.add(
+      'share inbox: ${url == null ? 'ignored (no YouTube link)' : 'got $url'}',
+    );
+    if (url != null) await startJob(url);
+  }
+
   void _handleShared(List<SharedMediaFile> files) {
     if (files.isEmpty) return;
     final url = extractYoutubeUrl(files.first.path);
@@ -154,6 +189,7 @@ class YoutubeDownloaderProvider extends ChangeNotifier {
       return;
     }
 
+    _lastUrl = url;
     final previous = _currentJob;
     _onOpenScreen?.call();
     final gen = _reset();
@@ -450,6 +486,7 @@ class YoutubeDownloaderProvider extends ChangeNotifier {
     _disposed = true;
     _generation++;
     _shareSub?.cancel();
+    _lifecycle?.dispose();
     _api.dispose();
     _onDevice.dispose();
     super.dispose();

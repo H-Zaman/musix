@@ -102,7 +102,5 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-    <key>NSExtensionActivationRule</key>
-    <string>TRUEPREDICATE extensionItems.attachments.registeredTypeIdentifiers CONTAINS "public.url"</string>
 </dict>
 </plist>
