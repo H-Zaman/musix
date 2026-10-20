@@ -2,13 +2,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:musix/providers/youtube_downloader_provider.dart';
 import 'package:musix/theme/winamp_theme.dart';
+import 'package:musix/widgets/backend_settings.dart';
 import 'package:provider/provider.dart';
 
 class YoutubeDownloaderScreen extends StatefulWidget {
   const YoutubeDownloaderScreen({super.key});
 
   @override
-  State<YoutubeDownloaderScreen> createState() => _YoutubeDownloaderScreenState();
+  State<YoutubeDownloaderScreen> createState() =>
+      _YoutubeDownloaderScreenState();
 }
 
 class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
@@ -35,24 +37,35 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('YOUTUBE → MP3'),
-        shape: Border(bottom: BorderSide(color: winampColors.border!, width: 2)),
+        shape: Border(
+          bottom: BorderSide(color: winampColors.border!, width: 2),
+        ),
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            _buildInputSection(winampColors, downloader),
-            const SizedBox(height: 24),
-            if (downloader.state != DownloaderState.idle)
-              _buildStatusSection(winampColors, downloader),
-          ],
+        child: SingleChildScrollView(
+          child: Column(
+            children: [
+              _buildInputSection(winampColors, downloader),
+              const SizedBox(height: 24),
+              if (downloader.state != DownloaderState.idle) ...[
+                _buildStatusSection(winampColors, downloader),
+                const SizedBox(height: 24),
+              ],
+              const BackendSettings(),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildInputSection(WinampColors colors, YoutubeDownloaderProvider downloader) {
-    final bool isLoading = downloader.state == DownloaderState.creating ||
+  Widget _buildInputSection(
+    WinampColors colors,
+    YoutubeDownloaderProvider downloader,
+  ) {
+    final bool isLoading =
+        downloader.state == DownloaderState.creating ||
         downloader.state == DownloaderState.processing ||
         downloader.state == DownloaderState.downloadingFile;
 
@@ -73,11 +86,17 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
                   style: colors.statusStyle?.copyWith(color: colors.textGreen),
                   decoration: InputDecoration(
                     hintText: 'PASTE YOUTUBE URL...',
-                    hintStyle: colors.statusStyle?.copyWith(color: Colors.white24),
+                    hintStyle: colors.statusStyle?.copyWith(
+                      color: Colors.white24,
+                    ),
                     filled: true,
                     fillColor: colors.displayBg,
-                    border: OutlineInputBorder(borderSide: BorderSide(color: colors.border!)),
-                    enabledBorder: OutlineInputBorder(borderSide: BorderSide(color: colors.border!)),
+                    border: OutlineInputBorder(
+                      borderSide: BorderSide(color: colors.border!),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderSide: BorderSide(color: colors.border!),
+                    ),
                   ),
                 ),
               ),
@@ -94,7 +113,9 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
             width: double.infinity,
             height: 44,
             child: ElevatedButton(
-              onPressed: isLoading ? null : () => downloader.startJob(_urlController.text),
+              onPressed: isLoading
+                  ? null
+                  : () => downloader.startJob(_urlController.text),
               style: ElevatedButton.styleFrom(
                 backgroundColor: colors.displayBg,
                 side: BorderSide(color: colors.textBlue!, width: 1),
@@ -102,7 +123,10 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
               ),
               child: Text(
                 'DOWNLOAD MP3',
-                style: colors.statusStyle?.copyWith(color: colors.textBlue, fontWeight: FontWeight.bold),
+                style: colors.statusStyle?.copyWith(
+                  color: colors.textBlue,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
           ),
@@ -111,7 +135,10 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
     );
   }
 
-  Widget _buildStatusSection(WinampColors colors, YoutubeDownloaderProvider downloader) {
+  Widget _buildStatusSection(
+    WinampColors colors,
+    YoutubeDownloaderProvider downloader,
+  ) {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -146,9 +173,12 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
     );
   }
 
-  Widget _buildProgressIndicator(WinampColors colors, YoutubeDownloaderProvider downloader) {
+  Widget _buildProgressIndicator(
+    WinampColors colors,
+    YoutubeDownloaderProvider downloader,
+  ) {
     final double progress = (downloader.currentJob?.progress ?? 0) / 100.0;
-    
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -159,11 +189,17 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
               downloader.state == DownloaderState.downloadingFile
                   ? 'SAVING TO DEVICE...'
                   : downloader.currentJob?.statusText ?? 'PROCESSING...',
-              style: colors.statusStyle?.copyWith(color: colors.textBlue, fontSize: 10),
+              style: colors.statusStyle?.copyWith(
+                color: colors.textBlue,
+                fontSize: 10,
+              ),
             ),
             Text(
               '${(progress * 100).toInt()}%',
-              style: colors.statusStyle?.copyWith(color: colors.textGreen, fontWeight: FontWeight.bold),
+              style: colors.statusStyle?.copyWith(
+                color: colors.textGreen,
+                fontWeight: FontWeight.bold,
+              ),
             ),
           ],
         ),
@@ -178,11 +214,17 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
     );
   }
 
-  Widget _buildMetricsRow(WinampColors colors, YoutubeDownloaderProvider downloader) {
+  Widget _buildMetricsRow(
+    WinampColors colors,
+    YoutubeDownloaderProvider downloader,
+  ) {
     if (downloader.state == DownloaderState.completed) {
       return Text(
         '✓ DOWNLOAD COMPLETE',
-        style: colors.statusStyle?.copyWith(color: colors.textGreen, fontWeight: FontWeight.bold),
+        style: colors.statusStyle?.copyWith(
+          color: colors.textGreen,
+          fontWeight: FontWeight.bold,
+        ),
       );
     }
 
@@ -201,7 +243,10 @@ class _YoutubeDownloaderScreenState extends State<YoutubeDownloaderScreen> {
     );
   }
 
-  Widget _buildActionButtons(WinampColors colors, YoutubeDownloaderProvider downloader) {
+  Widget _buildActionButtons(
+    WinampColors colors,
+    YoutubeDownloaderProvider downloader,
+  ) {
     if (downloader.state == DownloaderState.completed) {
       return SizedBox(
         width: double.infinity,

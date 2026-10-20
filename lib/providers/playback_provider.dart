@@ -46,7 +46,15 @@ class PlaybackProvider extends ChangeNotifier {
   String _searchQuery = '';
 
   static const String _prefSongsKey = 'musix_all_songs';
-  static const _audioExtensions = ['.mp3', '.m4a', '.wav', '.aac', '.flac'];
+  static const _audioExtensions = [
+    '.mp3',
+    '.m4a',
+    '.wav',
+    '.aac',
+    '.flac',
+    '.opus',
+    '.ogg',
+  ];
 
   List<AudioMetadata> get filteredSongs => _filteredSongs;
   bool get isScanning => _isScanning;

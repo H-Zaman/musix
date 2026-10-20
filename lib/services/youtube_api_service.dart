@@ -17,11 +17,42 @@ abstract interface class YoutubeApi {
     YoutubeJob job, {
     void Function(double fraction)? onProgress,
   });
+  String get baseUrl;
+  String get apiKey;
+
+  /// Points the client at another backend / key at runtime.
+  void configure({String? baseUrl, String? apiKey});
+
+  /// Null when the backend is reachable and accepts our key, else why not.
+  Future<String?> checkConnection();
   void dispose();
 }
 
 class YoutubeApiService implements YoutubeApi {
   late final Dio _dio;
+  String _baseUrl = ApiConfig.baseUrl;
+  String _apiKey = ApiConfig.apiKey;
+
+  @override
+  String get baseUrl => _baseUrl;
+  @override
+  String get apiKey => _apiKey;
+
+  @override
+  void configure({String? baseUrl, String? apiKey}) {
+    if (baseUrl != null && baseUrl.isNotEmpty) _baseUrl = baseUrl;
+    if (apiKey != null) _apiKey = apiKey;
+    _applyConfig();
+  }
+
+  void _applyConfig() {
+    _dio.options.baseUrl = _baseUrl;
+    if (_apiKey.isEmpty) {
+      _dio.options.headers.remove('x-api-key');
+    } else {
+      _dio.options.headers['x-api-key'] = _apiKey;
+    }
+  }
 
   YoutubeApiService() {
     _dio = Dio(
@@ -31,6 +62,8 @@ class YoutubeApiService implements YoutubeApi {
         receiveTimeout: const Duration(seconds: 15),
       ),
     );
+
+    _applyConfig();
 
     if (kDebugMode) {
       _dio.interceptors.add(
@@ -86,7 +119,7 @@ class YoutubeApiService implements YoutubeApi {
       throw Exception('Download URL is missing');
     }
 
-    final base = Uri.parse(ApiConfig.baseUrl);
+    final base = Uri.parse(_baseUrl);
     final resolved = base.resolve(downloadUrl);
     // The backend may hand back an absolute URL; only follow our own host.
     if (resolved.host != base.host || resolved.port != base.port) {
@@ -134,13 +167,23 @@ class YoutubeApiService implements YoutubeApi {
     return '${job.id}_$name.mp3';
   }
 
-  Future<bool> checkHealth() async {
+  @override
+  Future<String?> checkConnection() async {
     try {
-      final response = await _dio.get('/health');
-      return response.statusCode == 200;
-    } catch (e) {
-      debugPrint('Health check failed: $e');
-      return false;
+      await _dio.get('/health');
+    } on DioException catch (e) {
+      return 'Cannot reach $_baseUrl (${e.type.name})';
+    }
+    try {
+      // An unknown job id: 404 means we got past the API-key check.
+      await _dio.get('/api/jobs/_ping');
+      return null;
+    } on DioException catch (e) {
+      return switch (e.response?.statusCode) {
+        404 => null,
+        401 => 'Backend reachable, but the API key was rejected',
+        final code => 'Backend answered ${code ?? e.type.name}',
+      };
     }
   }
 

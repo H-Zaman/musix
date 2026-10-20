@@ -60,6 +60,7 @@ Future<void> main() async {
               create: (_) => YoutubeDownloaderProvider(
                 onDownloaded: playbackProvider.rescanLibrary,
                 onOpenScreen: MusixApp.openDownloader,
+                prefs: prefs,
               ),
             ),
           ],

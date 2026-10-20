@@ -19,6 +19,9 @@ class YoutubeJob {
   final String? filename;
   final String? downloadUrl;
 
+  /// Free-form status line (e.g. a retry notice); overrides [statusText].
+  final String? detail;
+
   YoutubeJob({
     required this.id,
     required this.status,
@@ -29,6 +32,7 @@ class YoutubeJob {
     this.error,
     this.filename,
     this.downloadUrl,
+    this.detail,
   });
 
   factory YoutubeJob.fromJson(Map<String, dynamic> json) {
@@ -72,6 +76,7 @@ class YoutubeJob {
       status == YoutubeJobStatus.cancelled;
 
   String get statusText {
+    if (detail != null) return detail!.toUpperCase();
     switch (status) {
       case YoutubeJobStatus.queued:
         return 'QUEUED...';
